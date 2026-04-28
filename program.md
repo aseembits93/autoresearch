@@ -20,11 +20,11 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script is gone — there is no training; the target model (`Qwen/Qwen3.5-0.8B`) is a fixed pre-trained checkpoint and you are optimizing its inference latency. You launch it simply as: `uv run optimize.py`.
+Each experiment runs on a single Mac (Apple Silicon via MPS). The training script is gone — there is no training; the target model (`Qwen/Qwen3.5-0.8B`) is a fixed pre-trained checkpoint and you are optimizing its inference latency. You launch it simply as: `uv run optimize.py`.
 
 **What you CAN do:**
-- Modify `optimize.py` — this is the only source file you edit. Inference code, attention implementation, KV cache, `torch.compile`, CUDA graphs, dtype, quantization (bnb / GPTQ / AWQ / fp8), weight surgery (pruning, layer-skipping, speculative decoding draft model) — everything that changes how generation happens is fair game.
-- Add dependencies. Edit `pyproject.toml` and run `uv sync`. Popular options to consider: `bitsandbytes`, `auto-gptq`, `autoawq`, `vllm`, `sglang`, `flash-attn`.
+- Modify `optimize.py` — this is the only source file you edit. Inference code, attention implementation, KV cache, `torch.compile`, dtype, quantization, weight surgery (pruning, layer-skipping, speculative decoding draft model) — everything that changes how generation happens is fair game.
+- Add dependencies. Edit `pyproject.toml` and run `uv sync`.
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed latency measurement harness, the correctness check, the prompt set, and the target model id.
@@ -34,7 +34,7 @@ Each experiment runs on a single GPU. The training script is gone — there is n
 
 **The goal is simple: get the lowest `latency_ms` while `correctness_ok` stays `true`.** Everything is fair game: swap attention implementations, quantize, compile, introduce a speculative-decoding draft, rewrite the decode loop to reuse KV caches across runs, whatever works. The only constraint is that outputs still match the reference within the per-prompt stable prefix (which the harness handles for you).
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful latency gains, but it should not blow up dramatically.
+**Memory** is a soft constraint. Some increase is acceptable for meaningful latency gains, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small latency improvement that adds ugly complexity is not worth it. Removing code and getting equal or better latency is a great outcome — a simplification win. A 0.1ms improvement that adds 40 lines of hacky plumbing? Probably not worth it. A 0.1ms improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -56,7 +56,7 @@ warmup_runs:      2
 measure_runs:     5
 ```
 
-Note that absolute numbers depend on your GPU — they are not comparable to runs on other hardware. You can extract the key metrics from the log file:
+Note that absolute numbers depend on your hardware — they are not comparable to runs on other machines. You can extract the key metrics from the log file:
 
 ```
 grep "^latency_ms:\|^correctness_ok:\|^peak_vram_mb:" run.log

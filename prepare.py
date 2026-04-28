@@ -21,6 +21,8 @@ import statistics
 
 import torch
 
+DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
@@ -95,7 +97,7 @@ def _greedy_generate_reference(model, tokenizer, prompt_ids_list):
     """Run the stock model greedily on each prompt; return list of generated-id lists."""
     outputs = []
     for prompt_ids in prompt_ids_list:
-        input_ids = torch.tensor([prompt_ids], device="cuda", dtype=torch.long)
+        input_ids = torch.tensor([prompt_ids], device=DEVICE, dtype=torch.long)
         out = model.generate(
             input_ids,
             max_new_tokens=MAX_NEW_TOKENS,
@@ -133,11 +135,11 @@ def build_reference():
     with open(PROMPTS_PATH, "rb") as f:
         prompt_ids_list = pickle.load(f)
 
-    print(f"Reference: loading stock {MODEL_ID} in bf16...")
+    print(f"Reference: loading stock {MODEL_ID} in fp16 on {DEVICE}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda"
-    )
+        MODEL_ID, torch_dtype=torch.float16,
+    ).to(DEVICE)
     model.eval()
     torch.manual_seed(SEED)
 
@@ -157,7 +159,6 @@ def build_reference():
     print(f"Reference: saved to {REFERENCE_PATH}")
 
     del model
-    torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def check_correctness(generate_fn):
     for i, (prompt_ids, ref, k) in enumerate(zip(prompts, reference, stable_len)):
         if k == 0:
             continue  # nothing reliably comparable for this prompt
-        input_ids = torch.tensor([prompt_ids], device="cuda", dtype=torch.long)
+        input_ids = torch.tensor([prompt_ids], device=DEVICE, dtype=torch.long)
         out = generate_fn(input_ids, MAX_NEW_TOKENS)
         gen = out[0, input_ids.shape[1]:].tolist()
         if len(gen) < k:
@@ -224,20 +225,21 @@ def measure_latency(generate_fn):
     prompts = load_prompts()
     per_prompt_medians = []
     for i, prompt_ids in enumerate(prompts):
-        input_ids = torch.tensor([prompt_ids], device="cuda", dtype=torch.long)
-        # Warmup (includes first-call compilation / cudnn autotune costs)
+        input_ids = torch.tensor([prompt_ids], device=DEVICE, dtype=torch.long)
         for _ in range(WARMUP_RUNS):
             _ = generate_fn(input_ids, MAX_NEW_TOKENS)
-        torch.cuda.synchronize()
+        if DEVICE == "mps":
+            torch.mps.synchronize()
         measurements_ms = []
         for _ in range(MEASURE_RUNS):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
+            if DEVICE == "mps":
+                torch.mps.synchronize()
+            t0 = time.perf_counter()
             _ = generate_fn(input_ids, MAX_NEW_TOKENS)
-            end.record()
-            torch.cuda.synchronize()
-            measurements_ms.append(start.elapsed_time(end))
+            if DEVICE == "mps":
+                torch.mps.synchronize()
+            t1 = time.perf_counter()
+            measurements_ms.append((t1 - t0) * 1000.0)
         median_ms = statistics.median(measurements_ms)
         per_prompt_medians.append(median_ms)
         print(f"  prompt {i:02d}: median={median_ms:.2f}ms "

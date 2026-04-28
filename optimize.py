@@ -1,5 +1,5 @@
 """
-Baseline inference script for latency autoresearch. Single GPU, single file.
+Baseline inference script for latency autoresearch. Single Mac, single file.
 
 The agent edits this file to reduce `latency_ms` while keeping
 `correctness_ok` true. The measurement harness and reference outputs live in
@@ -31,10 +31,9 @@ from prepare import (
 
 t_start = time.time()
 torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
 
-device = torch.device("cuda")
+device = torch.device("mps")
 
 # ---------------------------------------------------------------------------
 # Model + generate function (fair game to modify)
@@ -43,9 +42,8 @@ device = torch.device("cuda")
 def build_model():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
-    )
+        torch_dtype=torch.float16,
+    ).to("mps")
     model.eval()
     return model
 
@@ -87,13 +85,13 @@ if ok:
 else:
     latency_ms = float("nan")
 
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_mem_mb = torch.mps.current_allocated_memory() / 1024 / 1024
 total_seconds = time.time() - t_start
 
 print_summary(
     latency_ms=latency_ms,
     correctness_ok=ok,
-    peak_vram_mb=peak_vram_mb,
+    peak_vram_mb=peak_mem_mb,
     total_seconds=total_seconds,
     info=info if not ok else "",
 )
