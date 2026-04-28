@@ -1,19 +1,21 @@
 [project]
 name = "autoresearch"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous inference-latency research swarm for Qwen3.5-0.8B"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
+    "accelerate>=1.0",
+    "huggingface_hub>=0.26",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
+    "protobuf",
     "pyarrow>=21.0.0",
     "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
+    "sentencepiece",
     "torch==2.9.1",
+    "transformers>=4.46",
 ]
 
 [tool.uv.sources]

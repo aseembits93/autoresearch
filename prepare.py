@@ -1,389 +1,294 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time setup and fixed runtime utilities for latency autoresearch.
+
+Downloads the target model, builds the fixed prompt set, and captures a
+reference of greedy outputs from the unmodified model. Also provides the
+fixed measurement harness (`measure_latency`, `check_correctness`) that
+`optimize.py` imports.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    uv run prepare.py             # download model + build reference
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Artifacts land in ~/.cache/autoresearch-latency/.
 """
 
 import os
 import sys
 import time
-import math
-import argparse
 import pickle
-from multiprocessing import Pool
+import argparse
+import statistics
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
 import torch
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+MODEL_ID = "Qwen/Qwen3.5-0.8B"
+
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-latency")
+PROMPTS_PATH = os.path.join(CACHE_DIR, "prompts.pt")
+REFERENCE_PATH = os.path.join(CACHE_DIR, "reference.pt")
+
+MAX_NEW_TOKENS = 128     # tokens generated per prompt, fixed so runs are comparable
+WARMUP_RUNS = 2          # per-prompt warmup runs (discarded)
+MEASURE_RUNS = 5         # per-prompt measured runs (used for median)
+SEED = 0
+
+# Fixed prompt set. Varied lengths so agent optimizations don't overfit to a
+# single prefill size. These are checked into code (not downloaded) to keep
+# the benchmark 100% reproducible.
+PROMPTS = [
+    "Hello.",
+    "What is 2 + 2?",
+    "Write a single-sentence summary of photosynthesis.",
+    "List three prime numbers.",
+    "Translate to French: The cat sat on the mat.",
+    "Explain what a binary search tree is in one paragraph.",
+    "Give me a one-line Python function that returns the factorial of n.",
+    "Describe the plot of Hamlet in two sentences.",
+    "What are the differences between TCP and UDP? Keep it brief.",
+    "Compose a haiku about autumn leaves.",
+    "Why is the sky blue? Answer in three sentences, aimed at a ten-year-old.",
+    "Name five programming languages and one strength of each.",
+    "In a concise paragraph, explain the concept of entropy in information theory.",
+    "A farmer has 17 sheep, all but 9 die. How many are left? Show your reasoning, then give the final answer.",
+    "Write a short professional email declining a meeting invitation scheduled for next Tuesday.",
+    "Compare and contrast supervised and unsupervised learning. Respond in about 150 words, with clear structure.",
+]
+N_PROMPTS = len(PROMPTS)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# One-time setup
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+def download_model():
+    """Idempotent: pulls Qwen3.5-0.8B weights + tokenizer into the HF cache."""
+    from huggingface_hub import snapshot_download
+    print(f"Model: ensuring {MODEL_ID} is downloaded...")
+    snapshot_download(repo_id=MODEL_ID)
+    print(f"Model: {MODEL_ID} ready.")
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+def build_prompt_set():
+    """Tokenize the fixed prompt list and persist. Re-run is a no-op."""
+    if os.path.exists(PROMPTS_PATH):
+        print(f"Prompts: already built at {PROMPTS_PATH}")
         return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+    from transformers import AutoTokenizer
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    tokenized = []
+    for p in PROMPTS:
+        ids = tokenizer(p, return_tensors="pt").input_ids[0].tolist()
+        tokenized.append(ids)
+    with open(PROMPTS_PATH, "wb") as f:
+        pickle.dump(tokenized, f)
+    lens = [len(t) for t in tokenized]
+    print(f"Prompts: tokenized {len(tokenized)} prompts, "
+          f"len min/med/max = {min(lens)}/{statistics.median(lens):.0f}/{max(lens)}, "
+          f"saved to {PROMPTS_PATH}")
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def _greedy_generate_reference(model, tokenizer, prompt_ids_list):
+    """Run the stock model greedily on each prompt; return list of generated-id lists."""
+    outputs = []
+    for prompt_ids in prompt_ids_list:
+        input_ids = torch.tensor([prompt_ids], device="cuda", dtype=torch.long)
+        out = model.generate(
+            input_ids,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            temperature=1.0,
+            top_p=1.0,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        # Keep only the generated continuation (strip the prompt prefix)
+        gen = out[0, input_ids.shape[1]:].tolist()
+        outputs.append(gen)
+    return outputs
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def _common_prefix_len(a, b):
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
+
+def build_reference():
+    """
+    Generate reference outputs twice from the stock model and store them along
+    with a per-prompt `stable_prefix_len` — the longest prefix that matches
+    across two independent runs. This tolerates fp non-determinism without
+    inflating the correctness window.
+    """
+    if os.path.exists(REFERENCE_PATH):
+        print(f"Reference: already built at {REFERENCE_PATH}")
         return
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    with open(PROMPTS_PATH, "rb") as f:
+        prompt_ids_list = pickle.load(f)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    print(f"Reference: loading stock {MODEL_ID} in bf16...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda"
     )
+    model.eval()
+    torch.manual_seed(SEED)
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    print("Reference: generating pass 1...")
+    out1 = _greedy_generate_reference(model, tokenizer, prompt_ids_list)
+    print("Reference: generating pass 2...")
+    out2 = _greedy_generate_reference(model, tokenizer, prompt_ids_list)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    stable_len = [_common_prefix_len(a, b) for a, b in zip(out1, out2)]
+    for i, (a, b, k) in enumerate(zip(out1, out2, stable_len)):
+        flag = "" if k == MAX_NEW_TOKENS else f"  (NOTE: only {k}/{MAX_NEW_TOKENS} tokens stable across runs)"
+        print(f"  prompt {i:02d}: gen_len={len(a)}/{len(b)}  stable={k}{flag}")
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    payload = {"reference": out1, "stable_prefix_len": stable_len}
+    with open(REFERENCE_PATH, "wb") as f:
+        pickle.dump(payload, f)
+    print(f"Reference: saved to {REFERENCE_PATH}")
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    del model
+    torch.cuda.empty_cache()
+
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Runtime utilities (imported by optimize.py)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+def load_prompts():
+    """Return list[list[int]] of tokenized prompt ids."""
+    with open(PROMPTS_PATH, "rb") as f:
+        return pickle.load(f)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def load_reference():
+    """Return (list[list[int]] reference outputs, list[int] stable_prefix_len)."""
+    with open(REFERENCE_PATH, "rb") as f:
+        payload = pickle.load(f)
+    return payload["reference"], payload["stable_prefix_len"]
 
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Fixed measurement harness (DO NOT CHANGE — ground-truth metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def check_correctness(generate_fn):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Compare greedy outputs of `generate_fn` against the stored reference.
+    Uses the per-prompt stable prefix length (computed at reference time) so
+    floating-point non-determinism alone does not fail a run.
+
+    Returns (ok: bool, info: str).
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    prompts = load_prompts()
+    reference, stable_len = load_reference()
+    for i, (prompt_ids, ref, k) in enumerate(zip(prompts, reference, stable_len)):
+        if k == 0:
+            continue  # nothing reliably comparable for this prompt
+        input_ids = torch.tensor([prompt_ids], device="cuda", dtype=torch.long)
+        out = generate_fn(input_ids, MAX_NEW_TOKENS)
+        gen = out[0, input_ids.shape[1]:].tolist()
+        if len(gen) < k:
+            return False, f"prompt {i}: generated only {len(gen)} tokens, need {k}"
+        for j in range(k):
+            if gen[j] != ref[j]:
+                return False, (
+                    f"prompt {i} token {j}: got {gen[j]}, ref {ref[j]} "
+                    f"(stable prefix len for this prompt was {k})"
+                )
+    return True, "ok"
+
+
+@torch.no_grad()
+def measure_latency(generate_fn):
+    """
+    Measure wall-clock latency of `generate_fn(prompt_ids, max_new_tokens)`
+    across the fixed prompt set. Returns mean(per-prompt median) in ms.
+
+    Protocol per prompt:
+      - WARMUP_RUNS warmup calls (discarded)
+      - MEASURE_RUNS measured calls
+      - median of the measured runs is the per-prompt latency
+    Final metric: mean of per-prompt medians.
+    """
+    prompts = load_prompts()
+    per_prompt_medians = []
+    for i, prompt_ids in enumerate(prompts):
+        input_ids = torch.tensor([prompt_ids], device="cuda", dtype=torch.long)
+        # Warmup (includes first-call compilation / cudnn autotune costs)
+        for _ in range(WARMUP_RUNS):
+            _ = generate_fn(input_ids, MAX_NEW_TOKENS)
+        torch.cuda.synchronize()
+        measurements_ms = []
+        for _ in range(MEASURE_RUNS):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            _ = generate_fn(input_ids, MAX_NEW_TOKENS)
+            end.record()
+            torch.cuda.synchronize()
+            measurements_ms.append(start.elapsed_time(end))
+        median_ms = statistics.median(measurements_ms)
+        per_prompt_medians.append(median_ms)
+        print(f"  prompt {i:02d}: median={median_ms:.2f}ms "
+              f"(runs: {', '.join(f'{m:.1f}' for m in measurements_ms)})")
+    return statistics.mean(per_prompt_medians)
+
+
+def print_summary(latency_ms, correctness_ok, peak_vram_mb, total_seconds, info=""):
+    """
+    Print the final summary block. The grep contract for the agent loop is:
+        grep "^latency_ms:\\|^correctness_ok:\\|^peak_vram_mb:" run.log
+    """
+    import math as _math
+    print("---")
+    if latency_ms is None or (isinstance(latency_ms, float) and _math.isnan(latency_ms)):
+        print("latency_ms:       nan")
+    else:
+        print(f"latency_ms:       {latency_ms:.3f}")
+    print(f"correctness_ok:   {str(bool(correctness_ok)).lower()}")
+    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+    print(f"total_seconds:    {total_seconds:.1f}")
+    print(f"max_new_tokens:   {MAX_NEW_TOKENS}")
+    print(f"n_prompts:        {N_PROMPTS}")
+    print(f"warmup_runs:      {WARMUP_RUNS}")
+    print(f"measure_runs:     {MEASURE_RUNS}")
+    if info:
+        print(f"info:             {info}")
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare model + reference for latency autoresearch")
+    parser.add_argument("--force-reference", action="store_true",
+                        help="Rebuild reference even if cached.")
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    if args.force_reference and os.path.exists(REFERENCE_PATH):
+        os.remove(REFERENCE_PATH)
+
+    download_model()
     print()
-    print("Done! Ready to train.")
+    build_prompt_set()
+    print()
+    build_reference()
+    print()
+    print("Done! Ready to run experiments with `uv run optimize.py`.")
